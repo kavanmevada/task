@@ -60,13 +60,13 @@ impl Runnable {
     }
 }
 
-pub struct Task<T, Fut: Future<Output = T>> {
+pub struct Task<T> {
     runnable: Arc<Runnable>,
-    _owned: PhantomData<Fut>,
+    _owned: PhantomData<T>,
 }
 
-impl<T: Send + 'static, Fut: Future<Output = T>> Future for Task<T, Fut> {
-    type Output = Result<Fut::Output, Error>;
+impl<T: Send + 'static, Fut: Future<Output = T>> Future for Task<T> {
+    type Output = Result<T, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut res = self.runnable.output.lock().ok();
@@ -92,8 +92,8 @@ impl<T: Send + 'static, Fut: Future<Output = T>> Future for Task<T, Fut> {
     }
 }
 
-impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T, Fut> {
-    const EXEC_FN: &'static ExecFn = &Task::<T, Fut>::exec;
+impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T> {
+    const EXEC_FN: &'static ExecFn = &Task::<T>::exec;
 
     fn exec(runnable: Arc<Runnable>, cx: &mut Context) -> Poll<()> {
         if runnable
@@ -103,7 +103,7 @@ impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T, 
             if let Some(State::Awaiting(waker)) =
                 runnable.output.lock().as_deref_mut().ok().and_then(|lock| {
                     core::mem::replace(lock, Box::new(State::<T>::NotYetPolled))
-                        .downcast::<State<Fut::Output>>()
+                        .downcast::<State<T>>()
                         .map(|s| *s)
                         .ok()
                 })
@@ -135,7 +135,7 @@ impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T, 
                 if let Some(State::Awaiting(waker)) =
                     runnable.output.lock().as_deref_mut().ok().and_then(|lock| {
                         core::mem::replace(lock, Box::new(State::Ready(o)))
-                            .downcast::<State<Fut::Output>>()
+                            .downcast::<State<T>>()
                             .map(|s| *s)
                             .ok()
                     })
@@ -153,14 +153,14 @@ impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T, 
 pub fn spawn<T: Send + 'static, Fut: Future<Output = T> + Send + UnwindSafe + 'static>(
     fut: Fut,
     schedule_fn: impl Fn(Arc<Runnable>, &mut Context) -> Poll<()> + Send + Sync + 'static,
-) -> (Arc<Runnable>, Task<T, Fut>) {
-    let output = Mutex::new(Box::new(State::<Fut::Output>::NotYetPolled) as BoxedAny);
+) -> (Arc<Runnable>, Task<T>) {
+    let output = Mutex::new(Box::new(State::<T>::NotYetPolled) as BoxedAny);
 
     let runnable = Arc::new(Runnable {
         future: Mutex::new(Box::pin(fut)),
         output,
         schedule_fn: Arc::new(schedule_fn),
-        exec_fn: Task::<T, Fut>::EXEC_FN,
+        exec_fn: Task::<T>::EXEC_FN,
         is_cancelled: AtomicBool::new(false),
     });
 
