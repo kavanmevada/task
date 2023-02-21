@@ -2,7 +2,7 @@ extern crate alloc;
 
 use core::{
     any::Any,
-    future::{Future, IntoFuture},
+    future::Future,
     marker::PhantomData,
     panic::{AssertUnwindSafe, UnwindSafe},
     pin::Pin,
@@ -10,7 +10,7 @@ use core::{
 };
 
 use alloc::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{atomic::AtomicBool, Mutex};
 
 enum State<T: Send> {
     Ready(Result<T, Error>),
@@ -19,29 +19,39 @@ enum State<T: Send> {
 }
 
 type BoxedAny = Box<dyn Any + Send>;
-type ExecFn = dyn (Fn(&mut Runnable, &mut Context) -> Poll<()>) + Send + Sync;
+type ExecFn = dyn (Fn(Arc<Runnable>, &mut Context) -> Poll<()>) + Send + Sync;
 
 pub struct Runnable {
-    future: Pin<BoxedAny>,
-    output: Arc<Mutex<BoxedAny>>,
+    future: Mutex<Pin<BoxedAny>>,
+    output: Mutex<BoxedAny>,
+    schedule_fn: Arc<dyn Fn(Arc<Self>, &mut Context) -> Poll<()> + Send + Sync>,
     exec_fn: &'static ExecFn,
+    is_cancelled: AtomicBool,
 }
 
-impl Runnable {
-    pub fn run_or<'r, F, B, O>(&'r mut self, mut f: F) -> impl Future<Output = ()> + 'r
-    where
-        F: (FnMut(&mut Self) -> B) + 'r,
-        B: IntoFuture<Output = O>,
-    {
-        std::future::poll_fn(move |cx| {
-            let result = (self.exec_fn)(self, cx);
-            let fut = f(self).into_future();
+impl Unpin for Runnable {}
 
-            pin_utils::pin_mut!(fut);
+impl Runnable {
+    pub fn cancel(&mut self) {
+        self.is_cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn schedule<'r>(self: &'r Arc<Self>) -> impl Future<Output = ()> + 'r {
+        core::future::poll_fn(move |cx| (self.schedule_fn)(self.clone(), cx))
+    }
+
+    pub fn run<'r>(self: Arc<Self>) -> impl Future<Output = ()> + 'r {
+        std::future::poll_fn(move |cx| {
+            let result = (self.exec_fn)(Arc::clone(&self), cx);
+
+            if result.is_pending() {
+                println!("re-scheduling");
+            }
 
             match result {
                 Poll::Ready(_) => Poll::Ready(()),
-                Poll::Pending => match fut.as_mut().poll(cx) {
+                Poll::Pending => match (self.schedule_fn)(Arc::clone(&self), cx) {
                     Poll::Ready(_) => Poll::Ready(()),
                     Poll::Pending => Poll::Pending,
                 },
@@ -50,20 +60,29 @@ impl Runnable {
     }
 }
 
-pub struct Task<T, F: Future<Output = T>> {
-    output: Arc<Mutex<BoxedAny>>,
-    _owned: PhantomData<F>,
+pub struct Task<T, Fut: Future<Output = T>> {
+    runnable: Arc<Runnable>,
+    _owned: PhantomData<Fut>,
 }
 
-impl<T: Send + 'static, F: Future<Output = T>> Future for Task<T, F> {
-    type Output = Result<F::Output, Error>;
+impl<T: Send + 'static, Fut: Future<Output = T>> Future for Task<T, Fut> {
+    type Output = Result<Fut::Output, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut res = self.output.lock().ok();
+        let mut res = self.runnable.output.lock().ok();
+
         let res = res
             .as_mut()
             .and_then(|o| o.downcast_mut::<State<T>>())
             .expect("failed to downcast or posioned");
+
+        if self
+            .runnable
+            .is_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Poll::Ready(Err(Error::FutCancelled));
+        }
 
         match core::mem::replace(res, State::Awaiting(cx.waker().clone())) {
             State::Ready(o) => Poll::Ready(o),
@@ -76,11 +95,31 @@ impl<T: Send + 'static, F: Future<Output = T>> Future for Task<T, F> {
 impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T, Fut> {
     const EXEC_FN: &'static ExecFn = &Task::<T, Fut>::exec;
 
-    fn exec(runnable: &mut Runnable, cx: &mut Context) -> Poll<()> {
+    fn exec(runnable: Arc<Runnable>, cx: &mut Context) -> Poll<()> {
+        if runnable
+            .is_cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some(State::Awaiting(waker)) =
+                runnable.output.lock().as_deref_mut().ok().and_then(|lock| {
+                    core::mem::replace(lock, Box::new(State::<T>::NotYetPolled))
+                        .downcast::<State<Fut::Output>>()
+                        .map(|s| *s)
+                        .ok()
+                })
+            {
+                waker.wake()
+            }
+
+            return Poll::Ready(());
+        }
+
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             unsafe {
                 runnable
                     .future
+                    .lock()
+                    .unwrap()
                     .as_mut()
                     .map_unchecked_mut(|r| r.downcast_mut::<Fut>().unwrap())
             }
@@ -113,19 +152,20 @@ impl<T: Send + 'static, Fut: Future<Output = T> + UnwindSafe + 'static> Task<T, 
 
 pub fn spawn<T: Send + 'static, Fut: Future<Output = T> + Send + UnwindSafe + 'static>(
     fut: Fut,
-) -> (Runnable, Task<T, Fut>) {
-    let output = Arc::new(Mutex::new(
-        Box::new(State::<Fut::Output>::NotYetPolled) as BoxedAny
-    ));
+    schedule_fn: impl Fn(Arc<Runnable>, &mut Context) -> Poll<()> + Send + Sync + 'static,
+) -> (Arc<Runnable>, Task<T, Fut>) {
+    let output = Mutex::new(Box::new(State::<Fut::Output>::NotYetPolled) as BoxedAny);
 
-    let runnable = Runnable {
-        future: Box::pin(fut),
-        output: Arc::clone(&output),
+    let runnable = Arc::new(Runnable {
+        future: Mutex::new(Box::pin(fut)),
+        output,
+        schedule_fn: Arc::new(schedule_fn),
         exec_fn: Task::<T, Fut>::EXEC_FN,
-    };
+        is_cancelled: AtomicBool::new(false),
+    });
 
     let task = Task {
-        output,
+        runnable: runnable.clone(),
         _owned: PhantomData,
     };
 
@@ -135,6 +175,7 @@ pub fn spawn<T: Send + 'static, Fut: Future<Output = T> + Send + UnwindSafe + 's
 #[derive(Debug, PartialEq)]
 pub enum Error {
     ExecError,
+    FutCancelled,
 }
 
 #[cfg(test)]
@@ -156,14 +197,14 @@ mod tests {
     #[test]
     fn polled_before_run() {
         futures_lite::future::block_on(async {
-            let (mut runnable, task) = spawn(async_fibo(10));
+            let (runnable, task) = spawn(async_fibo(10), |_, _cx| Poll::Ready(()));
 
             std::thread::spawn(move || {
                 futures_lite::future::block_on({
                     std::thread::sleep(core::time::Duration::from_millis(250));
 
                     println!("runnable is polled!");
-                    runnable.run_or(|_| core::future::ready(println!("future re-scheduled!")))
+                    runnable.run()
                 })
             });
 
@@ -175,11 +216,9 @@ mod tests {
     #[test]
     fn polled_after_run() {
         futures_lite::future::block_on(async {
-            let (mut runnable, task) = spawn(async_fibo(10));
+            let (runnable, task) = spawn(async_fibo(10), |_, _cx| Poll::Ready(()));
 
-            futures_lite::future::block_on(
-                runnable.run_or(|_| core::future::ready(println!("future re-scheduled!"))),
-            );
+            futures_lite::future::block_on(runnable.run());
 
             assert_eq!(task.await, Ok(55));
         })

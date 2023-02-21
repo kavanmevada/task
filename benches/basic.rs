@@ -24,8 +24,11 @@ mod spawn_recursive {
     fn task(b: &mut crate::test::bench::Bencher) -> impl std::process::Termination {
         b.iter(move || {
             futures_lite::future::block_on(async {
-                let (mut runnable, task) = task::spawn(async_fibo(10));
-                runnable.run_or(|_| core::future::ready(())).await;
+                let (runnable, task) =
+                    task::spawn(async_fibo(10), |_, _cx| std::task::Poll::Ready(()));
+
+                runnable.schedule().await;
+                runnable.run().await;
 
                 assert_eq!(task.await, Ok(55));
             })

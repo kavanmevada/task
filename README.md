@@ -18,10 +18,14 @@ A task is created using `spawn()` which return a `Runnable` and a `Task`:
 let future = async { 1 + 2 };
 
 // Construct a task.
-let (runnable, task) = task::spawn(future);
+let (runnable, task) = task::spawn(future, move |runnable, cx| {
+    let fut = sender.send_async(runnable);
+    pin_utils::pin_mut!(fut);
 
-// Push the task into the queue.
-sender.send_async(runnable).await;
+    fut.poll(cx)
+});
+
+runnable.schedule();
 ```
 
 The `Runnable` is used to poll the task's future, and the `Task` is used to await its
@@ -33,7 +37,7 @@ Finally, we need a loop that takes scheduled tasks from the queue and runs them:
 for runnable in receiver {
 
 // A function that schedules the task when it gets woken up.
-    runnable.run(move |runnable| sender.send_async(runnable)).await;
+    runnable.run().await;
 }
 ```
 
